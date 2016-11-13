@@ -74,6 +74,32 @@ void cleanbuf ( int *sizebuf, char *buf, char *buf2 ) {
 
 }
 
+int encRSA( char *filename, char *original, char *encrypted ) {
+    FILE *f;
+    RSA *rsa;
+    int padding = RSA_PKCS1_OAEP_PADDING;
+    int enclen, rsa_len;
+
+    if( (f = fopen(filename, "r")) != NULL ) {
+        rsa = PEM_read_RSA_PUBKEY(f,NULL,NULL,NULL);
+        fclose(f);
+    } else {
+        perror("Open file error");
+        return 1;
+    }
+
+    padding = RSA_PKCS1_OAEP_PADDING;
+    rsa_len = RSA_size(rsa);
+
+    memset( encrypted, 0, MAX_SIZE );
+    if ( (enclen = RSA_public_encrypt( strlen(original), (unsigned char *)original, encrypted, rsa, padding )) < 0 ) {
+        return 1;
+    }
+    RSA_free(rsa);
+
+    return enclen;
+}
+
 int decRSA( int len, char *src, char *dst ) {
 
     FILE *f;
@@ -113,9 +139,12 @@ int encAES( char *key, char *iv, int len, char *msg, char *encrypted ) {
     printf("Origin Msg : %s\n", msg);
     printf("Msg length : %d\n", len);
 
+
     // Encrypt Message
     AES_cbc_encrypt( msg, encrypted, len, &aes, backup_iv, AES_ENCRYPT );
     free(backup_iv);
+
+    printf("Enc length : %d\n", strlen(encrypted));
 
 }
 
@@ -144,6 +173,7 @@ int decAES( char *key, char *iv, int len, char *msg, char *decrypted ) {
 
 int main(){
 
+    FILE *f;
     int sock_a, sock_b, fd;
     int sock_getlen, i;
     struct sockaddr_in destA, destB;
@@ -154,11 +184,15 @@ int main(){
     char *bufptr;
     char *hello = "hello";
     char *studentId = "0556074";
+    char *bob_pub = "bob.key";
     char *session, *iv;
     int sizebuf[1];
     char buffer[MAX_SIZE];
     char buffer2[MAX_SIZE];
     char backup[20];
+    char *bob_public;
+    char *req_msg1, *req_msg2;
+    char *req_msg_attack = "{\"Remark\": \"If you have any question, please mail to any TA ASAP.\", \"Favorite_Snack\": \"PineApplePie\", \"Authentication_Code\": \"a40e00df6a6df9ab0fcb943611867dc76b96a0f72866c3a428be824a876d48c9\", \"Account_ID\": \"0556074\", \"Account_Money\": \"0\", \"Feedback\": \"How is the midterm exam? Good?\", \"Favorite_Fruit\": \"Apple\", \"Favorite_Song\": [\"P\", \"P\", \"A\", \"P\"]}";
 
     // Alice : 140.113.194.88 port 50000
     bzero( (char *)&destA, sizeof(destA) );
@@ -170,7 +204,7 @@ int main(){
     bzero( (char *)&destB, sizeof(destB) );
     destB.sin_family = AF_INET;
     destB.sin_addr.s_addr = inet_addr("140.113.194.88");
-    destB.sin_port = htons(50005);
+    destB.sin_port = htons(50500);
 
     // Create socket to alice & bob
     if ( (sock_a = socket(AF_INET, SOCK_STREAM, 0)) < 0 )
@@ -185,9 +219,112 @@ int main(){
         perror("Cannot connect to server");
 
     // Send Student ID to Alice
-    sender( sock_a, studentId, strlen(studentId)+1 );
+    printf( "<----- Alice -----> \n" );
+    printf( "Send : %s\n", studentId );
+    sender( sock_a, studentId, strlen(studentId) );
     receiver( sock_a, sizebuf, buffer );
     printf( "Receive : %s\n", buffer );
+
+    // Receive bob's public key
+    printf( "<------ Bob ------> \n" );
+    printf( "Send : hello\n" );
+    sender( sock_b, hello, 5 );
+    receiver( sock_b, sizebuf, buffer2 );
+    //bob_public = calloc( sizeof(char) , sizebuf[0]+1 );
+    //memcpy( bob_public, buffer2, sizebuf[0]+1 );
+    //bob_public = strdup( buffer2 );
+    //printf( "Bob's public : \n%s\n", bob_public );
+
+    // Store Bob's public key
+    f = fopen(bob_pub,"w");
+    fprintf(f, "%s", buffer2 );
+    fclose(f);
+
+    cleanbuf( sizebuf, buffer, buffer2 );
+
+    // Read my public key
+    if( (fd = open( "./mykey/public.key", O_RDONLY )) == -1 ) {
+        perror("Cannot open public key. ");
+        return 1;
+    }
+
+    fstat( fd, &sb );
+    start = mmap( NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0 );
+    if ( start == MAP_FAILED ){
+        perror("Map failed.");
+        return 1;
+    }
+
+    printf( "<----- Alice -----> \n" );
+
+    // Send my public key to alice
+    sender( sock_a, start, sb.st_size );
+    close( fd );
+
+    // Receive RSA(aes session key , initial vec) from alice
+    receiver( sock_a, sizebuf, buffer );
+    len = decRSA( sizebuf[0], buffer, buffer2 );
+    session = strdup( buffer2 );
+    cleanbuf( sizebuf, buffer, buffer2 );
+    printf("Session length : %d\n", len);
+    printf("Session key    : \n%s\n", session);
+
+    receiver( sock_a, sizebuf, buffer );
+    len = decRSA( sizebuf[0], buffer, buffer2 );
+    iv = strdup( buffer2 );
+    cleanbuf( sizebuf, buffer, buffer2 );
+    printf("IV length : %d\n", len);
+    printf("Initial Vector : \n%s\n", iv);
+
+    // Receive AES(request msg1) from alice
+    receiver( sock_a, sizebuf, buffer );
+    decAES( session, iv, sizebuf[0], buffer, buffer2 );
+    req_msg1 = strdup( buffer2 );
+    cleanbuf( sizebuf, buffer, buffer2 );
+    printf("Request MSG1 : \n%s\n", req_msg1);
+
+    printf( "<------ Bob ------> \n" );
+
+    // Send RSA(session, iv) to Bob
+    len = encRSA( bob_pub, session, buffer );
+    printf("Encrypted session key length : %d\n", len);
+    sender( sock_b, buffer, len);
+
+    len = encRSA( bob_pub, iv, buffer2 );
+    printf("Encrypted iv key length : %d\n", len);
+    sender( sock_b, buffer2, len);
+
+    cleanbuf( sizebuf, buffer, buffer2 );
+
+    // Send AES(req_msg_attack) to Bob
+    //encAES( session, iv, strlen(req_msg_attack), req_msg_attack, buffer  );
+    //sender( sock_b, buffer, strlen(req_msg_attack)+1 );     //weird
+    encAES( session, iv, strlen(req_msg1), req_msg1, buffer  );
+    sender( sock_b, buffer, strlen(req_msg1)+1 );     //weird
+
+    cleanbuf( sizebuf, buffer, NULL );
+
+    // Receive Response msg1
+    receiver( sock_b, sizebuf, buffer );
+    decAES( session, iv, sizebuf[0], buffer, buffer2 );
+    printf("Response MSG1 : \n%s\n", buffer2);
+
+    cleanbuf( sizebuf, buffer, buffer2 );
+
+    // Receive "bye"
+    receiver( sock_b, sizebuf, buffer );
+    printf("Receive : %s\n", buffer );
+
+    printf( "<----- Alice -----> \n" );
+
+    // Send the msg to alice
+    encAES( session, iv, strlen(buffer), buffer, buffer2 );
+    sender( sock_a, buffer2, strlen(buffer2) );
+
+    cleanbuf( sizebuf, NULL , buffer2 );
+
+    receiver( sock_a, sizebuf, buffer );
+    printf("Receive : %s\n", buffer );
 
     return 0;
 
